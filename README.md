@@ -1,3 +1,9 @@
+### Reference  
+(intallation) https://github.com/microsoft/bayesianize  
+(code) https://github.com/hmi88/what  
+(paper) What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?, https://arxiv.org/abs/1703.04977  
+(paper) Sparse Uncertainty Representation in Deep Learning with Inducing Weights, https://arxiv.org/pdf/2105.14594.pdf
+
 ### Student-Teacher Feature Pyramid Matching for Unsupervised Anomaly Detection implementation (unofficial)
 Unofficial pytorch implementation of  
 Student-Teacher Feature Pyramid Matching for Unsupervised Anomaly Detection (STPM)  
