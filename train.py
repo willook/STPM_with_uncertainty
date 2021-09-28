@@ -1,3 +1,10 @@
+# python train.py --phase train --dataset_path /workspace/data/mvtec_anomaly_detection --category capsule --project_path ./logdir/resnet --model resnet
+# python train.py --phase train --category capsule --project_path ./logdir/resnet --uncertainty normal
+
+# TODO: train_teacher는 일단 잘안됨
+# TODO: aleatoric, epistemic 분산값 확인해보기
+# TODO: aleatoric 고치고 epistemic이랑 합쳐보기
+
 import argparse
 import torch
 from torch.nn import functional as F
@@ -11,6 +18,7 @@ import glob
 import shutil
 import time
 from torchvision.models import resnet18
+#from pytorch_pretrained_vit import ViT
 from PIL import Image
 from sklearn.metrics import roc_auc_score
 from torch import nn
@@ -18,6 +26,32 @@ import pytorch_lightning as pl
 import string
 import random
 from sklearn.metrics import confusion_matrix
+
+from networks import *
+from utils import turn_on_dropout
+from networks.resnet_var import ResnetVar
+import bnn
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning) 
+
+# def test_epistemic(self, input, forward_func):
+#     mean1s = []
+#     mean2s = []
+
+#     for i_sample in range(self.n_samples):
+#         results = forward_func(input)
+#         mean1 = results['mean']
+#         mean1s.append(mean1 ** 2)
+#         mean2s.append(mean1)
+
+#     mean1s_ = torch.stack(mean1s, dim=0).mean(dim=0)
+#     mean2s_ = torch.stack(mean2s, dim=0).mean(dim=0)
+
+#     var1 = mean1s_ - mean2s_ ** 2
+#     var1_norm = var1 / var1.max()
+#     results = {'mean': mean2s_, 'var': var1_norm}
+#     return results
 
 def copy_files(src, dst, ignores=[]):
     src_files = os.listdir(src)
@@ -175,34 +209,30 @@ def cal_confusion_matrix(y_true, y_pred_no_thresh, thresh, img_path_list):
     print(false_p)
     print('false negative')
     print(false_n)
-    
+
 
 class STPM(pl.LightningModule):
+
     def __init__(self, hparams):
         super(STPM, self).__init__()
-
         self.save_hyperparameters(hparams)
 
+        self.init_uncertainty()
+        if self.epistemic:
+            args.bnn = True
+        #assert not(args.bnn ^ self.epistemic), "Use bayesianized model for epistemic uncertainty"
+        
         self.init_features()
-        def hook_t(module, input, output):
-            self.features_t.append(output)
-        def hook_s(module, input, output):
-            self.features_s.append(output)
+        #def hook_t(module, input, output):
+        #    self.features_t.append(output)
+        #def hook_s(module, input, output):
+        #    self.features_s.append(output)
 
-        self.model_t = resnet18(pretrained=True).eval()
-        for param in self.model_t.parameters():
-            param.requires_grad = False
-
-        self.model_t.layer1[-1].register_forward_hook(hook_t)
-        self.model_t.layer2[-1].register_forward_hook(hook_t)
-        self.model_t.layer3[-1].register_forward_hook(hook_t)
-
-        self.model_s = resnet18(pretrained=False) # default: False
-        # self.model_s.apply(init_weights)
-        self.model_s.layer1[-1].register_forward_hook(hook_s)
-        self.model_s.layer2[-1].register_forward_hook(hook_s)
-        self.model_s.layer3[-1].register_forward_hook(hook_s)
-
+        if args.model == 'resnet':
+            self.init_model(args.uncertainty)
+        else:
+            raise argparse.ArgumentError
+        
         self.criterion = torch.nn.MSELoss(reduction='sum')
 
         self.gt_list_px_lvl = []
@@ -212,16 +242,95 @@ class STPM(pl.LightningModule):
         self.img_path_list = []
 
         self.data_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size), Image.ANTIALIAS),
+                        transforms.Resize((int(args.load_size), int(args.load_size)), Image.ANTIALIAS),
+                        #transforms.GaussianBlur(kernel_size=5, sigma=1),
                         transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size),
+                        transforms.CenterCrop(int(args.input_size)),
                         transforms.Normalize(mean=mean_train,
                                             std=std_train)])
         self.gt_transforms = transforms.Compose([
-                        transforms.Resize((args.load_size, args.load_size)),
+                        transforms.Resize((int(args.load_size), int(args.load_size))),
                         transforms.ToTensor(),
-                        transforms.CenterCrop(args.input_size)])                                            
+                        transforms.CenterCrop(int(args.input_size))])                                            
         self.inv_normalize = transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255])
+        print("\n*** Settings ***")
+        print(f"model_t:",self.model_t.__class__)
+        print(f"model_s:",self.model_s.__class__)
+        print(f"bayesianize:",args.bnn)
+        print(f"uncertainty:",self.uncertainty)
+        print(f"loss:", "mse_var" if self.aleatoric else "mse")
+        print(f"train teacher:",args.train_teacher)
+        
+    def init_uncertainty(self):
+        if args.uncertainty == "epistemic":
+            self.epistemic = True
+            self.aleatoric = False
+            self.uncertainty = "epistemic"
+        elif args.uncertainty == "aleatoric":
+            self.epistemic = False
+            self.aleatoric = True
+            self.uncertainty = "aleatoric"
+        elif args.uncertainty == "combined":
+            self.epistemic = True
+            self.aleatoric = True
+            self.uncertainty = "combined"
+        elif args.uncertainty == "normal":
+            self.epistemic = False
+            self.aleatoric = False
+            self.uncertainty = "normal"
+        else:
+            raise NotImplementedError
+        
+    def init_model(self, uncertainty = "normal"):
+        def hook_p(module, input, output):
+            self.features_p.append(output)
+        def hook_t(module, input, output):
+            self.features_t.append(output)
+        def hook_s(module, input, output):
+            self.features_s.append(output)
+        def hook_s_mean(module, input, output):
+            self.features_s_mean.append(output)
+        def hook_s_var(module, input, output):
+            self.features_s_var.append(output)
+        
+        # Teacher network
+        if args.train_teacher:
+            self.model_p = resnet18(pretrained=True).eval()
+            for param in self.model_p.parameters():
+                param.requires_grad = False
+            self.model_p.layer1[-1].register_forward_hook(hook_p)
+            self.model_p.layer2[-1].register_forward_hook(hook_p)
+            self.model_p.layer3[-1].register_forward_hook(hook_p)
+
+            self.model_t = resnet18(pretrained=True)
+        else:
+            self.model_t = resnet18(pretrained=True).eval()
+            for param in self.model_t.parameters():
+                param.requires_grad = False
+        self.model_t.layer1[-1].register_forward_hook(hook_t)
+        self.model_t.layer2[-1].register_forward_hook(hook_t)
+        self.model_t.layer3[-1].register_forward_hook(hook_t)
+
+        # Student network
+        if not self.aleatoric:
+            self.model_s = resnet18(pretrained=False) # default: False
+            # self.model_s.apply(init_weights)
+            self.model_s.layer1[-1].register_forward_hook(hook_s)
+            self.model_s.layer2[-1].register_forward_hook(hook_s)
+            self.model_s.layer3[-1].register_forward_hook(hook_s)
+        else:
+            # inference mean and var by resnet
+            self.model_s = ResnetVar(norm_var=args.norm_var)
+            self.model_s.model_mean.layer1.register_forward_hook(hook_s_mean)
+            self.model_s.model_mean.layer2.register_forward_hook(hook_s_mean)
+            self.model_s.model_mean.layer3.register_forward_hook(hook_s_mean)
+            
+            self.model_s.model_var.layer1.register_forward_hook(hook_s_var)
+            self.model_s.model_var.layer2.register_forward_hook(hook_s_var)
+            self.model_s.model_var.layer3.register_forward_hook(hook_s_var)
+        if args.bnn:
+            bnn.bayesianize_(self.model_s, inference="inducing", inducing_rows=64, inducing_cols=64)  
+        return 
 
     def init_results_list(self):
         self.gt_list_px_lvl = []
@@ -231,14 +340,69 @@ class STPM(pl.LightningModule):
         self.img_path_list = []    
 
     def init_features(self):
+        self.features_p = []
         self.features_t = []
         self.features_s = []
+        self.features_s_mean = []
+        self.features_s_var = []
+
+    def train(self):
+        if args.train_teacher:
+            self.model_p.eval()
+            self.model_t.train()
+        else:
+            self.model_t.eval()
+        self.model_s.train()
+
+    def eval(self):
+        if args.train_teacher:
+            self.model_p.eval()
+        self.model_t.eval()
+        self.model_s.eval()
 
     def forward(self, x):
         self.init_features()
-        x_t = self.model_t(x)
-        x_s = self.model_s(x)
-        return self.features_t, self.features_s
+        f_t, f_s_mean, f_s_var = self._forward(x)
+        x_p = None
+        if args.train_teacher:
+            x_p = self.model_p(x)
+        return self.features_p, f_t, f_s_mean, f_s_var
+
+    def _forward(self, x):
+        if self.uncertainty == "normal":
+            x_s = self.model_s(x)
+            x_t = self.model_t(x)
+            return self.features_t, self.features_s, None
+        elif self.uncertainty == "aleatoric":
+            x_s_mean, x_s_var = self.model_s(x)
+            x_t = self.model_t(x)
+            self.features_s_var[0] = self.features_s_var[0].mean(dim=1,keepdim=True)
+            self.features_s_var[1] = self.features_s_var[1].mean(dim=1,keepdim=True)
+            self.features_s_var[2] = self.features_s_var[2].mean(dim=1,keepdim=True)
+            return self.features_t, self.features_s_mean, self.features_s_var
+        elif self.uncertainty == "epistemic":
+            x_t = self.model_t(x)
+            for _ in range(args.num_samples):
+                x_s = self.model_s(x)
+                #print("len(self.features_s): ",len(self.features_s))
+                #input("")
+            l1_mean2s_ = torch.stack(self.features_s[0::3], dim=0).mean(dim=0)
+            l2_mean2s_ = torch.stack(self.features_s[1::3], dim=0).mean(dim=0)
+            l3_mean2s_ = torch.stack(self.features_s[2::3], dim=0).mean(dim=0)
+            
+            mean1s = [f**2 for f in self.features_s]
+            l1_mean1s_ = torch.stack(mean1s[0::3], dim=0).mean(dim=0)
+            l2_mean1s_ = torch.stack(mean1s[1::3], dim=0).mean(dim=0)
+            l3_mean1s_ = torch.stack(mean1s[2::3], dim=0).mean(dim=0)
+            l1_var = (l1_mean1s_ - l1_mean2s_**2).mean(dim=1,keepdim=True)
+            l2_var = (l2_mean1s_ - l2_mean2s_**2).mean(dim=1,keepdim=True)
+            l3_var = (l3_mean1s_ - l3_mean2s_**2).mean(dim=1,keepdim=True)
+            self.features_s_mean = [l1_mean2s_, l2_mean2s_, l3_mean2s_]
+            self.features_s_var = [l1_var, l2_var, l3_var]
+            self.features_s = []
+            return self.features_t, self.features_s_mean, self.features_s_var
+        else:
+            raise NotImplementedError
 
     def cal_loss(self, fs_list, ft_list):
         tot_loss = 0
@@ -249,10 +413,59 @@ class STPM(pl.LightningModule):
             fs_norm = F.normalize(fs, p=2)
             ft_norm = F.normalize(ft, p=2)
             f_loss = (0.5/(w*h))*self.criterion(fs_norm, ft_norm)
-            tot_loss += f_loss
-            
+            tot_loss += f_loss        
         return tot_loss
     
+    def cal_loss_var(self, fs_mean_list, fs_var_list, ft_list):
+        tot_loss = 0
+        for i in range(len(ft_list)):
+            fs_mean = fs_mean_list[i]
+            fs_var = fs_var_list[i]
+            # TODO: fs_var 차원 확장
+            fs_var = fs_var.expand(fs_mean.shape)
+            ft = ft_list[i]
+            _, _, h, w = fs_mean.shape
+            fs_mean_norm = F.normalize(fs_mean, p=2)
+            # TODO: fs_var_norm?
+            ft_norm = F.normalize(ft, p=2)
+            #f_loss = (0.5/(w*h))*self.criterion(fs_norm, ft_norm)
+            #print(fs_var.shape)
+            #print(fs_var.sum())
+            #input()
+            loss1 = torch.mul(torch.exp(-fs_var), (fs_mean_norm - ft_norm) ** 2)
+            
+            # converge loss2 to 1
+            #var_t = torch.ones(fs_var.size()).to('cuda')
+            #loss2 = torch.nn.functional.mse_loss(fs_var, var_t)
+            
+            loss2 = fs_var
+            f_loss = (.5 * (loss1 + loss2)).mean()
+            tot_loss += f_loss
+        return tot_loss
+    
+    def cal_loss_teacher(self, fp_list, ft_list, fs_var_list):
+        tot_loss = 0
+        for i in range(len(ft_list)):
+            fp = fp_list[i]
+            ft = ft_list[i]
+            _, _, h, w = fp.shape
+            if self.aleatoric:
+                fp_norm = F.normalize(fp, p=2) * fs_var_list[i]
+                ft_norm = F.normalize(ft, p=2) * fs_var_list[i]
+            else:
+                fp_norm = F.normalize(fp, p=2)
+                ft_norm = F.normalize(ft, p=2) 
+
+            f_loss = (0.5/(w*h))*self.criterion(fp_norm, ft_norm)
+            tot_loss += f_loss        
+        return tot_loss
+
+    # TODO: uncertainty 추가
+    # TODO: 이론적, aleatoric uncertainty: teacher network의 불확실성을 계산, 의미 없을듯? 
+    # TODO: 이론적, epistemic uncertainty: student network의 불확실성을 계산
+    # TODO: aleatoric uncertainty 어떤식으로 나오는지 확인해보기
+    # TODO: teacher fine turing 필요할까? alpha star supervised 처럼 일정 범위 안벗어나지만 학습,kl 쓸지, mse쓸지
+    # , epistemic
     def cal_anomaly_map(self, fs_list, ft_list, out_size=224):
         if args.amap_mode == 'mul':
             anomaly_map = np.ones([out_size, out_size])
@@ -275,7 +488,31 @@ class STPM(pl.LightningModule):
                 anomaly_map += a_map
         return anomaly_map, a_map_list
 
-    def save_anomaly_map(self, anomaly_map, a_maps, input_img, gt_img, file_name, x_type):
+    def cal_variance_map(self, fs_var_list, out_size=224):
+        self.fs_var_list = fs_var_list
+        if args.amap_mode == 'mul':
+            var_map = np.ones([out_size, out_size])
+        else:
+            var_map = np.zeros([out_size, out_size])
+        v_map_list = []
+        for i in range(len(fs_var_list)):
+            fs_var = fs_var_list[i]
+            if self.aleatoric and not self.epistemic:
+                fs_var = torch.exp(fs_var)
+            #v_map = F.normalize(fs_var, p=2)
+            v_map = fs_var / max(fs_var.max(), 1e-12)
+            #a_map = 1 - F.cosine_similarity(fs_norm, ft_norm)
+            #v_map = torch.unsqueeze(v_map, dim=1)
+            v_map = F.interpolate(v_map, size=out_size, mode='bilinear')
+            v_map = v_map[0,0,:,:].to('cpu').detach().numpy()
+            v_map_list.append(v_map)
+            if args.amap_mode == 'mul':
+                var_map *= v_map
+            else:
+                var_map += v_map
+        return var_map, v_map_list
+
+    def save_anomaly_map(self, anomaly_map, a_maps, input_img, gt_img, file_name, x_type, postfix="am"):
         anomaly_map_norm = min_max_norm(anomaly_map)
         anomaly_map_norm_hm = cvt2heatmap(anomaly_map_norm*255)
         # 64x64 map
@@ -294,19 +531,27 @@ class STPM(pl.LightningModule):
         # save images
         # file_name = id_generator() # random id
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}.jpg'), input_img)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_am64.jpg'), am64)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_am32.jpg'), am32)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_am16.jpg'), am16)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap.jpg'), anomaly_map_norm_hm)
-        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_amap_on_img.jpg'), hm_on_img)
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_{postfix}64.jpg'), am64)
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_{postfix}32.jpg'), am32)
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_{postfix}16.jpg'), am16)
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_{postfix}.jpg'), anomaly_map_norm_hm)
+        cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_{postfix}_on_img.jpg'), hm_on_img)
         cv2.imwrite(os.path.join(self.sample_path, f'{x_type}_{file_name}_gt.jpg'), gt_img)
 
     def configure_optimizers(self):
-        return torch.optim.SGD(self.model_s.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        #if uncertainty in ["normal", "aleatoric"]:
+        #elif uncertainty in ["epistemic", "combined"]:
+        if args.train_teacher:
+            return torch.optim.SGD([
+                    {'params': self.model_s.parameters()},
+                    {'params': self.model_t.parameters()},
+                ], lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        else:
+            return torch.optim.SGD(self.model_s.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     def train_dataloader(self):
         image_datasets = MVTecDataset(root=os.path.join(args.dataset_path,args.category), transform=self.data_transforms, gt_transform=self.gt_transforms, phase='train')
-        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True, num_workers=0) #, pin_memory=True)
+        train_loader = DataLoader(image_datasets, batch_size=args.batch_size, shuffle=True, num_workers=12) #, pin_memory=True)
         return train_loader
 
 #     def val_dataloader(self):
@@ -318,61 +563,102 @@ class STPM(pl.LightningModule):
         test_datasets = MVTecDataset(root=os.path.join(args.dataset_path,args.category), transform=self.data_transforms, gt_transform=self.gt_transforms, phase='test')
         test_loader = DataLoader(test_datasets, batch_size=1, shuffle=False, num_workers=0) #, pin_memory=True) # only work on batch_size=1, now.
         return test_loader
+    
+    def val_dataloader(self):
+        test_datasets = MVTecDataset(root=os.path.join(args.dataset_path,args.category), transform=self.data_transforms, gt_transform=self.gt_transforms, phase='test')
+        test_loader = DataLoader(test_datasets, batch_size=1, shuffle=False, num_workers=0) #, pin_memory=True) # only work on batch_size=1, now.
+        return test_loader
 
     def on_train_start(self):
         self.model_t.eval() # to stop running_var move (maybe not critical)
         self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
     
-#     def on_validation_start(self):
-#         self.init_results_list()    
+    def on_validation_start(self):
+        self.init_results_list()    
 
     def on_test_start(self):
         self.init_results_list()
         self.sample_path, self.source_code_save_path = prep_dirs(self.logger.log_dir)
 
     def training_step(self, batch, batch_idx):
+        self.train()
         x, _, _, file_name, _ = batch
-        features_t, features_s = self(x)
-        loss = self.cal_loss(features_s, features_t)
+        if not self.aleatoric:
+            features_p, features_t, features_s, features_s_var = self(x) # features_s_var is None
+            loss = self.cal_loss(features_s, features_t)
+        else:
+            features_p, features_t, features_s_mean, features_s_var = self(x)
+            loss = self.cal_loss_var(features_s_mean, features_s_var, features_t)
+        if args.train_teacher:
+            loss += args.teacher_weight*self.cal_loss_teacher(features_p, features_t, features_s_var)
         self.log('train_loss', loss, on_epoch=True)
         return loss
 
-#     def validation_step(self, batch, batch_idx):
-#         x, gt, label, file_name, x_type = batch
-#         features_t, features_s = self(x)
-#         # Get anomaly map
-#         anomaly_map, _ = self.cal_anomaly_map(features_s, features_t, out_size=args.input_size)
+    # TODO: validation을 사용하면 test 데이터를 쓴게 되는건가?
+    def validation_step(self, batch, batch_idx):
+        self.eval()
+        with torch.no_grad():
+            x, gt, label, file_name, x_type = batch
+            if not self.aleatoric:
+                features_p, features_t, features_s, _ = self(x)
+            else:
+                features_p, features_t, features_s, features_s_var = self(x)
+            
+            # Get anomaly map
+            anomaly_map, a_map_list = self.cal_anomaly_map(features_s, features_t, out_size=args.input_size)
 
-#         gt_np = gt.cpu().numpy().astype(int)
-#         self.gt_list_px_lvl.extend(gt_np.ravel())
-#         self.pred_list_px_lvl.extend(anomaly_map.ravel())
-#         self.gt_list_img_lvl.append(label.cpu().numpy()[0])
-#         self.pred_list_img_lvl.append(anomaly_map.max())
-#         self.img_path_list.extend(file_name)
-
-    def test_step(self, batch, batch_idx):
-        x, gt, label, file_name, x_type = batch
-        features_t, features_s = self(x)
-        
-        # Get anomaly map
-        anomaly_map, a_map_list = self.cal_anomaly_map(features_s, features_t, out_size=args.input_size)
-
-        gt_np = gt.cpu().numpy().astype(int)
-        self.gt_list_px_lvl.extend(gt_np.ravel())
-        self.pred_list_px_lvl.extend(anomaly_map.ravel())
-        self.gt_list_img_lvl.append(label.cpu().numpy()[0])
-        self.pred_list_img_lvl.append(anomaly_map.max())
-        self.img_path_list.extend(file_name)
+            gt_np = gt.cpu().numpy().astype(int)
+            self.gt_list_px_lvl.extend(gt_np.ravel())
+            self.pred_list_px_lvl.extend(anomaly_map.ravel())
+            self.gt_list_img_lvl.append(label.cpu().numpy()[0])
+            self.pred_list_img_lvl.append(anomaly_map.max())
+            self.img_path_list.extend(file_name)
         # save images
-        x = self.inv_normalize(x)
-        input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)
-        self.save_anomaly_map(anomaly_map, a_map_list, input_x, gt_np[0][0]*255, file_name[0], x_type[0])
+        #x = self.inv_normalize(x)
+        #input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)
+        #self.save_anomaly_map(anomaly_map, a_map_list, input_x, gt_np[0][0]*255, file_name[0], x_type[0])
+        
+    def test_step(self, batch, batch_idx):
+        self.eval()
+        with torch.no_grad():
+            x, gt, label, file_name, x_type = batch
+            #if not self.aleatoric:
+            features_p, features_t, features_s, features_s_var = self(x)
+            #else:
+            #    features_p, features_t, features_s, features_s_var = self(x)
+            
+            # Get anomaly map
+            anomaly_map, a_map_list = self.cal_anomaly_map(features_s, features_t, out_size=args.input_size)
+            
+            gt_np = gt.cpu().numpy().astype(int)
+            self.gt_list_px_lvl.extend(gt_np.ravel())
+            self.pred_list_px_lvl.extend(anomaly_map.ravel())
+            self.gt_list_img_lvl.append(label.cpu().numpy()[0])
+            self.pred_list_img_lvl.append(anomaly_map.max())
+            self.img_path_list.extend(file_name)
+            # save images
+            x = self.inv_normalize(x)
+            input_x = cv2.cvtColor(x.permute(0,2,3,1).cpu().numpy()[0]*255, cv2.COLOR_BGR2RGB)
+            self.save_anomaly_map(anomaly_map, a_map_list, input_x, gt_np[0][0]*255, file_name[0], x_type[0])
 
-#     def validation_epoch_end(self, outputs):
-#         pixel_auc = roc_auc_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
-#         img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
-#         values = {'pixel_auc': pixel_auc, 'img_auc': img_auc}
-#         self.log_dict(values)
+            # save variance images
+            if self.uncertainty != "normal":
+                var_map, v_map_list = self.cal_variance_map(features_s_var, out_size=args.input_size)
+                self.save_anomaly_map(var_map, v_map_list, input_x, gt_np[0][0]*255, file_name[0], x_type[0], postfix="var")
+            
+    def validation_epoch_end(self, outputs):
+        #try:
+        #print("Total pixel-level auc-roc score :")
+        pixel_auc = roc_auc_score(self.gt_list_px_lvl, self.pred_list_px_lvl)        
+        #print(pixel_auc)
+        #print("Total image-level auc-roc score :")
+        img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
+        #print(img_auc)
+        values = {'pixel_auc': pixel_auc, 'img_auc': img_auc}
+        print("\n",values)
+        self.log_dict(values)
+        #except ValueError as e:
+        #    print(e)
 
     def test_epoch_end(self, outputs):
         print("Total pixel-level auc-roc score :")
@@ -404,21 +690,33 @@ class STPM(pl.LightningModule):
 def get_args():
     parser = argparse.ArgumentParser(description='ANOMALYDETECTION')
     parser.add_argument('--phase', choices=['train','test'], default='train')
-    parser.add_argument('--dataset_path', default=r'D:\Dataset\mvtec_anomaly_detection') #/tile') #'/home/changwoo/hdd/datasets/mvtec_anomaly_detection'
-    parser.add_argument('--category', default='grid')
-    parser.add_argument('--num_epochs', default=100)
-    parser.add_argument('--lr', default=0.4)
+    parser.add_argument('--model', choices=['resnet','wide-resnet'], default='resnet')
+    parser.add_argument('--dataset_path', default='/workspace/data/mvtec_anomaly_detection') #/tile') #'/home/changwoo/hdd/datasets/mvtec_anomaly_detection'
+    parser.add_argument('--category', default='capsule')
+    parser.add_argument('--num_epochs', type=int, default=200)
+    parser.add_argument('--lr', type=float, default=0.4)
     parser.add_argument('--momentum', default=0.9)
     parser.add_argument('--weight_decay', default=0.0001)
-    parser.add_argument('--batch_size', default=32)
+    parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--load_size', default=256) # 256
     parser.add_argument('--input_size', default=256)
-    parser.add_argument('--project_path', default=r'D:\Project_Train_Results\mvtec_anomaly_detection\210624\test') #'/home/changwoo/hdd/project_results/STPM_lightning/210621') #210605') #
+    parser.add_argument('--project_path', default='/workspace/anomaly/STPM_anomaly_detection/logdir') #'/home/changwoo/hdd/project_results/STPM_lightning/210621') #210605') #
     parser.add_argument('--save_src_code', default=True)
     parser.add_argument('--save_anomaly_map', default=True)
     parser.add_argument('--amap_mode', choices=['mul','sum'], default='mul')
-    parser.add_argument('--val_freq', default=5)
+    parser.add_argument('--val_freq', type=int, default=10)
+    parser.add_argument('--resume', action='store_true')
     parser.add_argument('--weights_file_version', type=str, default=None)
+    parser.add_argument('--norm_var', action='store_true')
+    parser.add_argument('--bnn', action='store_true')
+    parser.add_argument('--num_samples', type=int, default=5)
+    parser.add_argument('--gpu', type=str, default="1")
+    parser.add_argument('--uncertainty', default='normal',
+                    choices=('normal', 'epistemic', 'aleatoric', 'combined'))
+    parser.add_argument('--train_teacher', action='store_true')
+    parser.add_argument('--teacher_weight', type=float, default=1)
+        
+    #parser.add_argument('--gpus', default=0)
     # parser.add_argument('--weights_file_version', type=str, default='version_1')
     args = parser.parse_args()
     return args
@@ -428,10 +726,17 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args = get_args()
     
-    trainer = pl.Trainer.from_argparse_args(args, default_root_dir=os.path.join(args.project_path, args.category), max_epochs=args.num_epochs, gpus=[0]) #, check_val_every_n_epoch=args.val_freq,  num_sanity_val_steps=0) # ,fast_dev_run=True)
-    
+    gpu_list = [int(gpu_) for gpu_ in args.gpu.split(",")]
+    #trainer = pl.Trainer.from_argparse_args(args, default_root_dir=os.path.join(args.project_path, args.category), max_epochs=args.num_epochs, gpus=[0], check_val_every_n_epoch=args.val_freq) #, check_val_every_n_epoch=args.val_freq,  num_sanity_val_steps=0) # ,fast_dev_run=True)
+    trainer = pl.Trainer.from_argparse_args(args, default_root_dir=os.path.join(args.project_path, args.category), max_epochs=args.num_epochs, gpus=gpu_list, check_val_every_n_epoch=args.val_freq, num_sanity_val_steps=0) #, check_val_every_n_epoch=args.val_freq,  num_sanity_val_steps=0) # ,fast_dev_run=True)
+    #trainer = pl.Trainer.from_argparse_args(args, default_root_dir=os.path.join(args.project_path, args.category), max_epochs=args.num_epochs, gpus=gpu_list) #, check_val_every_n_epoch=args.val_freq,  num_sanity_val_steps=0) # ,fast_dev_run=True)
+    # auto_lr_find=False
+    # Trainer(min_steps=100, min_epochs=0)
     if args.phase == 'train':
         model = STPM(hparams=args)
+        if args.resume:
+            checkpoint_path = "./logdir/resnet/capsule/lightning_logs/version_44/checkpoints/epoch=38-step=272.ckpt"
+            model = model.load_from_checkpoint(checkpoint_path)
         trainer.fit(model)
         trainer.test(model)
     elif args.phase == 'test':
